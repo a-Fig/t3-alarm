@@ -121,12 +121,7 @@ function retryAt(alarm, minutes, reason) {
 }
 function backoff(alarm, reason) {
   alarm.failures = (alarm.failures ?? 0) + 1;
-  if (alarm.failures > 12) {
-    alarm.status = "failed";
-    alarm.lastIssue = reason;
-    log("failed", alarm.id, reason);
-    return;
-  }
+  if (alarm.failures > 12) return finish(alarm, "failed", reason);
   retryAt(alarm, BACKOFF_MIN[Math.min(alarm.failures - 1, BACKOFF_MIN.length - 1)], reason);
 }
 
@@ -159,18 +154,10 @@ async function attempt(alarm) {
   try {
     thread = await readThread(alarm.threadId);
   } catch (error) {
-    if (error.status === 404) {
-      alarm.status = "failed";
-      alarm.lastIssue = "thread not found";
-      return;
-    }
+    if (error.status === 404) return finish(alarm, "failed", "thread not found");
     return backoff(alarm, error.cause?.code === "ECONNREFUSED" || /fetch failed/.test(error.message) ? "T3 Code isn't running" : error.message);
   }
-  if (thread.deletedAt || thread.archivedAt) {
-    alarm.status = "failed";
-    alarm.lastIssue = "thread was deleted or archived";
-    return;
-  }
+  if (thread.deletedAt || thread.archivedAt) return finish(alarm, "failed", "thread was deleted or archived");
   const busy = thread.session?.status === "running" || thread.latestTurn?.state === "running";
   alarm.waitingSince ??= busy ? new Date().toISOString() : undefined;
   if (busy && Date.now() - new Date(alarm.waitingSince) < WAIT_FOR_IDLE_MS) {
@@ -231,7 +218,7 @@ async function verify(alarm) {
     return;
   }
   if (turn.state !== "completed" && !reply.trim()) return backoff(alarm, `turn ended ${turn.state}: ${thread.session?.lastError ?? "no reply"}`);
-  finish(alarm, "delivered", `reply received (${turn.state})`);
+  return finish(alarm, "delivered", `reply received (${turn.state})`);
 }
 
 async function finish(alarm, status, note) {
