@@ -1,0 +1,10 @@
+{
+  "name": "t3-alarm",
+  "version": "0.1.0",
+  "description": "Alarms for Claude Code sessions running in T3 Code.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  }
+}
