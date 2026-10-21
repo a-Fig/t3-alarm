@@ -234,7 +234,11 @@ async function verify(alarm) {
   if (reset && alarm.kind === "continue" && reset - Date.now() > CONTINUE_WINDOW_MS + 90_000) {
     return finish(alarm, "cancelled", `a longer limit, resetting ${fmtLocal(reset.toISOString())}`);
   }
-  if (alarm.kind === "continue") alarm.stalledTurnId = turn.turnId; // any retry goes on from this turn
+  const delivered = !reset && (turn.state === "completed" || reply.trim());
+  if (delivered) return finish(alarm, "delivered", `reply received (${turn.state})`);
+  // A continue that retries goes on from this turn. One that's delivered keeps its old turn, so the
+  // scan still catches this turn if it ends at a later limit.
+  if (alarm.kind === "continue") alarm.stalledTurnId = turn.turnId;
   if (reset > Date.now()) {
     alarm.status = "retrying";
     alarm.nextAttemptAt = reset.toISOString();
@@ -244,8 +248,7 @@ async function verify(alarm) {
   }
   // A stated reset already past would retry at once, every tick: back off instead.
   if (reset) return backoff(alarm, "usage limit still in force after its stated reset");
-  if (turn.state !== "completed" && !reply.trim()) return backoff(alarm, `turn ended ${turn.state}: ${thread.session?.lastError ?? "no reply"}`);
-  return finish(alarm, "delivered", `reply received (${turn.state})`);
+  return backoff(alarm, `turn ended ${turn.state}: ${thread.session?.lastError ?? "no reply"}`);
 }
 
 async function finish(alarm, status, note) {
