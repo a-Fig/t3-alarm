@@ -78,6 +78,70 @@ export function parseWhen({ at, inMinutes }, now = new Date()) {
   return when;
 }
 
+// "You've hit your session limit · resets 7pm (America/Los_Angeles)", or "resets Oct 20, 3pm" for a longer one.
+export const LIMIT_RE = /hit your (?:[\w-]+ )?limit[^\n]*?resets\s+([A-Za-z]{3,9}\s+\d{1,2},?\s+)?(\d{1,2}(?::\d{2})?\s*[ap]m)/i;
+
+/**
+ * When a usage-limit message says the limit resets: that local time on or after `from`, plus a 90 s
+ * margin. A time up to 15 minutes before `from` is taken as just past, not as tomorrow: the reply
+ * can land a little after the stated reset. A date more than a day before `from` is next year's.
+ */
+export function limitResetsAt(text, from = new Date()) {
+  const match = text.match(LIMIT_RE);
+  if (!match) return null;
+  const base = new Date(from);
+  const when = new Date(base);
+  const clock = match[2].replace(/\s+/g, "").toLowerCase().match(/^(\d{1,2})(?::(\d{2}))?([ap]m)$/);
+  let hour = Number(clock[1]) % 12;
+  if (clock[3] === "pm") hour += 12;
+  if (match[1]) {
+    const day = new Date(`${match[1].replace(",", "")} ${when.getFullYear()}`);
+    if (!Number.isNaN(day.getTime())) when.setFullYear(day.getFullYear(), day.getMonth(), day.getDate());
+  }
+  when.setHours(hour, Number(clock[2] ?? 0), 0, 0);
+  if (match[1] && when < base - 24 * 3600_000) when.setFullYear(when.getFullYear() + 1);
+  if (!match[1] && when < base - 15 * 60_000) when.setDate(when.getDate() + 1);
+  return new Date(when.getTime() + 90_000);
+}
+
+/**
+ * Threads whose latest turn ended at a usage limit no more than `windowMs` before `now`, and whose
+ * limit resets no more than `windowMs` after it was hit: the five-hour limit, not the weekly one.
+ * The reset time is T3's own `runtime.warning` for that turn when it recorded one (it doesn't always),
+ * otherwise the "resets 7pm" in the reply, read from when the turn ended.
+ */
+export async function findLimitStalls(now = new Date(), windowMs = 5 * 3600_000) {
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(T3_DB, { readOnly: true });
+  let rows;
+  try {
+    rows = db.prepare(`
+      select t.thread_id, tu.turn_id, tu.completed_at, m.text,
+        (select json_extract(a.payload_json, '$.detail.resetsAt') from projection_thread_activities a
+          where a.thread_id = t.thread_id and a.turn_id = tu.turn_id and a.kind = 'runtime.warning'
+            and json_extract(a.payload_json, '$.detail.status') = 'rejected'
+            and json_extract(a.payload_json, '$.detail.resetsAt') is not null
+          order by a.sequence desc limit 1) as resets_at
+      from projection_threads t
+      join projection_turns tu on tu.thread_id = t.thread_id and tu.turn_id = t.latest_turn_id
+      left join projection_thread_messages m on m.message_id = tu.assistant_message_id
+      where t.deleted_at is null and t.archived_at is null and tu.state = 'error'
+        and tu.completed_at >= ? and tu.completed_at <= ?`)
+      .all(new Date(now.getTime() - windowMs).toISOString(), now.toISOString());
+  } finally {
+    db.close();
+  }
+  const stalls = [];
+  for (const row of rows) {
+    const hitAt = new Date(row.completed_at);
+    const resetAt = row.resets_at ? new Date(row.resets_at * 1000 + 90_000) : limitResetsAt(row.text ?? "", hitAt);
+    const gap = resetAt ? resetAt - 90_000 - hitAt : NaN;
+    if (!(gap >= -15 * 60_000 && gap <= windowMs)) continue; // NaN fails too
+    stalls.push({ threadId: row.thread_id, turnId: row.turn_id, hitAt, resetAt });
+  }
+  return stalls;
+}
+
 /** Call the daemon's control API on 127.0.0.1. Throws if it isn't running. */
 export async function daemonRequest(method, route, body) {
   const info = readJson(PATHS.daemon, null);
