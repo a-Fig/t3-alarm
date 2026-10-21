@@ -8,6 +8,8 @@ I wanted an alarm that waits out a usage limit, survives a closed laptop, and dr
 
 Claude Code, running in T3 Code, can set an alarm. At that time the alarm's prompt arrives in the same thread as a new message (`⏰ …`), through T3 Code's local API. It waits for a turn in progress, and if the reply is a usage-limit error it tries again after the limit resets.
 
+The usual case needs no alarm at all. Any thread a usage limit stops gets `⏰ Usage limit reset — continue` once the limit resets, if it was hit in the last five hours and resets within five hours of being hit: the five-hour limit, not the weekly one.
+
 It is a small Windows daemon and an MCP server, with no dependencies.
 
 ## Requirements
@@ -55,6 +57,7 @@ node cli.mjs status | list [--all] | cancel <id> | set <thread-id> <minutes|time
 - Each alarm also registers a Windows scheduled task (`\t3-alarm\alarm-<id>`) a minute early, set to wake the computer, which starts the daemon if it isn't running.
 - The prompt is posted to T3 Code's HTTP API as a user message. If the thread is mid-turn it waits, up to 30 minutes.
 - After sending, it reads the reply. A usage-limit error means another attempt 90 seconds after the stated reset time; other failures retry with backoff.
+- Every minute it also looks in T3's database for threads whose latest turn ended at a usage limit, and gives each a continue alarm for the reset: T3's recorded reset time, or the "resets 7pm" in the reply. A continue alarm that is cancelled stays cancelled, and one is dropped if the thread has moved on by the time it goes off.
 - The MCP server finds its own thread from the `--resume=<session>` that T3 passes to Claude Code, then looks the session up in T3's database.
 
 ## Limits

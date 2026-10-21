@@ -7,14 +7,19 @@ import http from "node:http";
 import { execFile } from "node:child_process";
 import path from "node:path";
 import {
-  CODE_DIR, DEFAULT_PORT, HOME, PATHS, T3_DB, T3_RUNTIME, VERSION, fmtLocal, readJson, writeJsonAtomic,
+  CODE_DIR, DEFAULT_PORT, HOME, PATHS, T3_DB, T3_RUNTIME, VERSION, findLimitStalls, fmtLocal, limitResetsAt, readJson,
+  writeJsonAtomic,
 } from "./lib.mjs";
 
 const TICK_MS = 15_000; // also how late an alarm can be while the laptop is awake
 const WAIT_FOR_IDLE_MS = 30 * 60_000; // a thread mid-turn gets this long before the alarm goes in anyway
 const KEEP_FINISHED_MS = 7 * 24 * 3600_000;
 const BACKOFF_MIN = [1, 2, 5, 15, 30, 60];
-const LIMIT_RE = /hit your (?:[\w-]+ )?limit[^\n]*?resets\s+([A-Za-z]{3,9}\s+\d{1,2},?\s+)?(\d{1,2}(?::\d{2})?\s*[ap]m)/i;
+// Continue alarms: any thread stopped by a limit hit in the last five hours, that resets within five
+// hours of being hit, gets this message once it resets. Nothing has to ask for it.
+const SCAN_MS = 60_000;
+const CONTINUE_WINDOW_MS = 5 * 3600_000;
+const CONTINUE_PROMPT = "Usage limit reset — continue";
 
 fs.mkdirSync(HOME, { recursive: true });
 
@@ -125,27 +130,38 @@ function backoff(alarm, reason) {
   retryAt(alarm, BACKOFF_MIN[Math.min(alarm.failures - 1, BACKOFF_MIN.length - 1)], reason);
 }
 
-/** "resets 3:40am" (or "resets Oct 20, 3pm"): the next such local time, plus a 90 s margin. */
-function limitResetsAt(text) {
-  const match = text.match(LIMIT_RE);
-  if (!match) return null;
-  const when = new Date();
-  const clock = match[2].replace(/\s+/g, "").toLowerCase().match(/^(\d{1,2})(?::(\d{2}))?([ap]m)$/);
-  let hour = Number(clock[1]) % 12;
-  if (clock[3] === "pm") hour += 12;
-  if (match[1]) {
-    const day = new Date(`${match[1].replace(",", "")} ${when.getFullYear()}`);
-    if (!Number.isNaN(day.getTime())) when.setFullYear(day.getFullYear(), day.getMonth(), day.getDate());
-  }
-  when.setHours(hour, Number(clock[2] ?? 0), 0, 0);
-  if (!match[1] && when <= new Date()) when.setDate(when.getDate() + 1);
-  return new Date(when.getTime() + 90_000);
-}
-
 /** The message as it appears in the thread: the prompt, marked as an alarm, with a note only if it's late. */
 function promptText(alarm) {
   const late = Math.round((Date.now() - new Date(alarm.fireAt)) / 60_000);
-  return `⏰ ${late >= 2 ? `(${late} min late) ` : ""}${alarm.prompt}`;
+  // A continue alarm's time is when the limit reset, not when anyone asked for it: lateness means nothing.
+  return `⏰ ${late >= 2 && alarm.kind !== "continue" ? `(${late} min late) ` : ""}${alarm.prompt}`;
+}
+
+/**
+ * Give each thread the usage limit stopped a continue alarm for when it resets. A thread is skipped
+ * if this stall already has one (even a cancelled one), or another alarm already sent into it is
+ * still watching its reply, since that one retries after the reset on its own.
+ */
+async function scanForLimitStalls() {
+  let stalls;
+  try {
+    stalls = await findLimitStalls(new Date(), CONTINUE_WINDOW_MS);
+  } catch (error) {
+    return log("scan error", error.message);
+  }
+  for (const stall of stalls) {
+    if (alarms.some((a) => a.stalledTurnId === stall.turnId)) continue;
+    if (alarms.some((a) => active(a) && a.threadId === stall.threadId && a.dispatchedAt)) continue;
+    const alarm = {
+      id: crypto.randomBytes(4).toString("hex"), kind: "continue", label: "continue after limit", prompt: CONTINUE_PROMPT,
+      threadId: stall.threadId, stalledTurnId: stall.turnId, fireAt: stall.resetAt.toISOString(),
+      createdAt: new Date().toISOString(), status: "scheduled",
+    };
+    alarms.push(alarm);
+    save();
+    log("continue", alarm.id, "for", alarm.fireAt, "thread", stall.threadId, "limit hit", stall.hitAt.toISOString());
+    if (stall.resetAt > Date.now()) await addWakeTask(alarm);
+  }
 }
 
 async function attempt(alarm) {
@@ -158,6 +174,9 @@ async function attempt(alarm) {
     return backoff(alarm, error.cause?.code === "ECONNREFUSED" || /fetch failed/.test(error.message) ? "T3 Code isn't running" : error.message);
   }
   if (thread.deletedAt || thread.archivedAt) return finish(alarm, "failed", "thread was deleted or archived");
+  if (alarm.kind === "continue" && thread.latestTurn?.turnId !== alarm.stalledTurnId) {
+    return finish(alarm, "cancelled", "thread moved on before the limit reset");
+  }
   const busy = thread.session?.status === "running" || thread.latestTurn?.state === "running";
   alarm.waitingSince ??= busy ? new Date().toISOString() : undefined;
   if (busy && Date.now() - new Date(alarm.waitingSince) < WAIT_FOR_IDLE_MS) {
@@ -210,6 +229,10 @@ async function verify(alarm) {
     .map((m) => m.text ?? "").join("\n");
   const evidence = `${reply}\n${thread.session?.lastError ?? ""}`;
   const reset = limitResetsAt(evidence);
+  if (reset && alarm.kind === "continue") {
+    if (reset - Date.now() > CONTINUE_WINDOW_MS + 90_000) return finish(alarm, "cancelled", `a longer limit, resetting ${fmtLocal(reset.toISOString())}`);
+    alarm.stalledTurnId = turn.turnId; // the turn the retry continues from
+  }
   if (reset) {
     alarm.status = "retrying";
     alarm.nextAttemptAt = reset.toISOString();
@@ -231,10 +254,15 @@ async function finish(alarm, status, note) {
 }
 
 let ticking = false;
+let lastScan = 0;
 async function tick() {
   if (ticking) return;
   ticking = true;
   try {
+    if (Date.now() - lastScan >= SCAN_MS) {
+      lastScan = Date.now();
+      await scanForLimitStalls();
+    }
     const now = Date.now();
     for (const alarm of alarms) {
       if (!active(alarm)) continue;
