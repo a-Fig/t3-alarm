@@ -81,11 +81,16 @@ export function parseWhen({ at, inMinutes }, now = new Date()) {
 // "You've hit your session limit · resets 7pm (America/Los_Angeles)", or "resets Oct 20, 3pm" for a longer one.
 export const LIMIT_RE = /hit your (?:[\w-]+ )?limit[^\n]*?resets\s+([A-Za-z]{3,9}\s+\d{1,2},?\s+)?(\d{1,2}(?::\d{2})?\s*[ap]m)/i;
 
-/** When a usage-limit message says the limit resets: the first such local time after `from`, plus a 90 s margin. */
+/**
+ * When a usage-limit message says the limit resets: that local time on or after `from`, plus a 90 s
+ * margin. A time up to 15 minutes before `from` is taken as just past, not as tomorrow: the reply
+ * can land a little after the stated reset. A date more than a day before `from` is next year's.
+ */
 export function limitResetsAt(text, from = new Date()) {
   const match = text.match(LIMIT_RE);
   if (!match) return null;
-  const when = new Date(from);
+  const base = new Date(from);
+  const when = new Date(base);
   const clock = match[2].replace(/\s+/g, "").toLowerCase().match(/^(\d{1,2})(?::(\d{2}))?([ap]m)$/);
   let hour = Number(clock[1]) % 12;
   if (clock[3] === "pm") hour += 12;
@@ -94,7 +99,8 @@ export function limitResetsAt(text, from = new Date()) {
     if (!Number.isNaN(day.getTime())) when.setFullYear(day.getFullYear(), day.getMonth(), day.getDate());
   }
   when.setHours(hour, Number(clock[2] ?? 0), 0, 0);
-  if (!match[1] && when <= new Date(from)) when.setDate(when.getDate() + 1);
+  if (match[1] && when < base - 24 * 3600_000) when.setFullYear(when.getFullYear() + 1);
+  if (!match[1] && when < base - 15 * 60_000) when.setDate(when.getDate() + 1);
   return new Date(when.getTime() + 90_000);
 }
 
@@ -113,6 +119,7 @@ export async function findLimitStalls(now = new Date(), windowMs = 5 * 3600_000)
       select t.thread_id, tu.turn_id, tu.completed_at, m.text,
         (select json_extract(a.payload_json, '$.detail.resetsAt') from projection_thread_activities a
           where a.thread_id = t.thread_id and a.turn_id = tu.turn_id and a.kind = 'runtime.warning'
+            and json_extract(a.payload_json, '$.detail.status') = 'rejected'
             and json_extract(a.payload_json, '$.detail.resetsAt') is not null
           order by a.sequence desc limit 1) as resets_at
       from projection_threads t
@@ -128,7 +135,8 @@ export async function findLimitStalls(now = new Date(), windowMs = 5 * 3600_000)
   for (const row of rows) {
     const hitAt = new Date(row.completed_at);
     const resetAt = row.resets_at ? new Date(row.resets_at * 1000 + 90_000) : limitResetsAt(row.text ?? "", hitAt);
-    if (!resetAt || resetAt - 90_000 - hitAt > windowMs) continue;
+    const gap = resetAt ? resetAt - 90_000 - hitAt : NaN;
+    if (!(gap >= -15 * 60_000 && gap <= windowMs)) continue; // NaN fails too
     stalls.push({ threadId: row.thread_id, turnId: row.turn_id, hitAt, resetAt });
   }
   return stalls;

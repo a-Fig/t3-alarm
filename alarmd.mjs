@@ -174,7 +174,9 @@ async function attempt(alarm) {
     return backoff(alarm, error.cause?.code === "ECONNREFUSED" || /fetch failed/.test(error.message) ? "T3 Code isn't running" : error.message);
   }
   if (thread.deletedAt || thread.archivedAt) return finish(alarm, "failed", "thread was deleted or archived");
-  if (alarm.kind === "continue" && thread.latestTurn?.turnId !== alarm.stalledTurnId) {
+  // Another alarm sent since this one was set may not show in the thread yet (same tick, after sleep).
+  const otherSent = alarms.some((a) => a !== alarm && a.threadId === alarm.threadId && a.dispatchedAt > alarm.createdAt);
+  if (alarm.kind === "continue" && (thread.latestTurn?.turnId !== alarm.stalledTurnId || otherSent)) {
     return finish(alarm, "cancelled", "thread moved on before the limit reset");
   }
   const busy = thread.session?.status === "running" || thread.latestTurn?.state === "running";
@@ -229,17 +231,19 @@ async function verify(alarm) {
     .map((m) => m.text ?? "").join("\n");
   const evidence = `${reply}\n${thread.session?.lastError ?? ""}`;
   const reset = limitResetsAt(evidence);
-  if (reset && alarm.kind === "continue") {
-    if (reset - Date.now() > CONTINUE_WINDOW_MS + 90_000) return finish(alarm, "cancelled", `a longer limit, resetting ${fmtLocal(reset.toISOString())}`);
-    alarm.stalledTurnId = turn.turnId; // the turn the retry continues from
+  if (reset && alarm.kind === "continue" && reset - Date.now() > CONTINUE_WINDOW_MS + 90_000) {
+    return finish(alarm, "cancelled", `a longer limit, resetting ${fmtLocal(reset.toISOString())}`);
   }
-  if (reset) {
+  if (alarm.kind === "continue") alarm.stalledTurnId = turn.turnId; // any retry goes on from this turn
+  if (reset > Date.now()) {
     alarm.status = "retrying";
     alarm.nextAttemptAt = reset.toISOString();
     alarm.lastIssue = `usage limit; trying again at ${fmtLocal(alarm.nextAttemptAt)}`;
     log("limit", alarm.id, alarm.lastIssue);
     return;
   }
+  // A stated reset already past would retry at once, every tick: back off instead.
+  if (reset) return backoff(alarm, "usage limit still in force after its stated reset");
   if (turn.state !== "completed" && !reply.trim()) return backoff(alarm, `turn ended ${turn.state}: ${thread.session?.lastError ?? "no reply"}`);
   return finish(alarm, "delivered", `reply received (${turn.state})`);
 }
