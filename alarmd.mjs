@@ -1,5 +1,5 @@
 // The alarm daemon: keeps alarms on disk, and at each alarm's time sends its prompt into a T3 Code
-// thread as a user message, through T3 Code's own local HTTP API. One instance per user; started at
+// thread as a user message, through T3 Code's own CLI. One instance per user; started at
 // login (Startup folder), by the MCP server, and by each alarm's wake task, whichever comes first.
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -7,8 +7,8 @@ import http from "node:http";
 import { execFile } from "node:child_process";
 import path from "node:path";
 import {
-  CODE_DIR, DEFAULT_PORT, HOME, PATHS, T3_DB, T3_RUNTIME, VERSION, findLimitStalls, fmtLocal, limitResetsAt, readJson,
-  writeJsonAtomic,
+  CODE_DIR, DEFAULT_PORT, HOME, PATHS, T3_RUNTIME, VERSION, findLimitStalls, fmtLocal, limitResetsAt, readJson,
+  readThreadState, sendToThread, threadForClaudeSession, writeJsonAtomic,
 } from "./lib.mjs";
 
 const TICK_MS = 15_000; // also how late an alarm can be while the laptop is awake
@@ -72,20 +72,12 @@ async function t3(method, route, body) {
   }
   return data;
 }
-const readThread = (threadId) => t3("GET", `/api/orchestration/threads/${threadId}?turnLimit=2`).then((d) => d.thread);
-
-/** Which T3 thread a Claude Code session belongs to: T3 records the session it resumes per thread. */
-async function threadForClaudeSession(sessionId) {
-  const { DatabaseSync } = await import("node:sqlite");
-  const db = new DatabaseSync(T3_DB, { readOnly: true });
-  try {
-    const row = db
-      .prepare("select thread_id from provider_session_runtime where json_extract(resume_cursor_json, '$.resume') = ?")
-      .get(sessionId);
-    return row?.thread_id ?? null;
-  } finally {
-    db.close();
-  }
+// Threads are read from T3's database and messaged through its CLI (see lib.mjs): T3 0.1.2 no longer
+// serves /api/orchestration/threads or /dispatch. Only the status check below still uses the HTTP API.
+async function readThread(threadId) {
+  const thread = await readThreadState(threadId);
+  if (!thread) throw Object.assign(new Error(`no thread ${threadId}`), { status: 404 });
+  return thread;
 }
 
 // --- wake tasks: a Windows scheduled task per alarm that wakes the laptop a minute early and
@@ -171,15 +163,15 @@ async function attempt(alarm) {
     thread = await readThread(alarm.threadId);
   } catch (error) {
     if (error.status === 404) return finish(alarm, "failed", "thread not found");
-    return backoff(alarm, error.cause?.code === "ECONNREFUSED" || /fetch failed/.test(error.message) ? "T3 Code isn't running" : error.message);
+    return backoff(alarm, error.message);
   }
   if (thread.deletedAt || thread.archivedAt) return finish(alarm, "failed", "thread was deleted or archived");
   // Another alarm sent since this one was set may not show in the thread yet (same tick, after sleep).
   const otherSent = alarms.some((a) => a !== alarm && a.threadId === alarm.threadId && a.dispatchedAt > alarm.createdAt);
-  if (alarm.kind === "continue" && (thread.latestTurn?.turnId !== alarm.stalledTurnId || otherSent)) {
+  if (alarm.kind === "continue" && (thread.runId !== alarm.stalledTurnId || otherSent)) {
     return finish(alarm, "cancelled", "thread moved on before the limit reset");
   }
-  const busy = thread.session?.status === "running" || thread.latestTurn?.state === "running";
+  const busy = thread.state === "running" || thread.state === "queued";
   alarm.waitingSince ??= busy ? new Date().toISOString() : undefined;
   if (busy && Date.now() - new Date(alarm.waitingSince) < WAIT_FOR_IDLE_MS) {
     alarm.status = "waiting";
@@ -187,23 +179,13 @@ async function attempt(alarm) {
     alarm.nextAttemptAt = new Date(Date.now() + 20_000).toISOString();
     return;
   }
-  const messageId = crypto.randomUUID();
   try {
-    await t3("POST", "/api/orchestration/dispatch", {
-      type: "thread.turn.start",
-      commandId: crypto.randomUUID(),
-      threadId: alarm.threadId,
-      message: { messageId, role: "user", text: promptText(alarm), attachments: [] },
-      runtimeMode: thread.runtimeMode,
-      interactionMode: thread.interactionMode,
-      createdAt: new Date().toISOString(),
-    });
+    await sendToThread(alarm.threadId, promptText(alarm));
   } catch (error) {
     return backoff(alarm, `dispatch failed: ${error.message}`);
   }
   alarm.status = "delivering";
   alarm.dispatchedAt = new Date().toISOString();
-  alarm.messageId = messageId;
   alarm.waitingSince = undefined;
   alarm.nextAttemptAt = new Date(Date.now() + 20_000).toISOString();
   log("dispatched", alarm.id, "to", alarm.threadId);
@@ -219,26 +201,24 @@ async function verify(alarm) {
     alarm.lastIssue = `checking the reply: ${error.message}`;
     return;
   }
-  const turn = thread.latestTurn;
-  const ours = turn && new Date(turn.requestedAt) >= new Date(new Date(alarm.dispatchedAt).getTime() - 5_000);
+  const ours = thread.runId && new Date(thread.requestedAt) >= new Date(new Date(alarm.dispatchedAt).getTime() - 5_000);
   const sinceDispatch = Date.now() - new Date(alarm.dispatchedAt);
-  if (!ours || turn.state === "running") {
+  if (!ours || thread.state === "running" || thread.state === "queued") {
     if (sinceDispatch > 6 * 3600_000) return finish(alarm, "delivered", "still running after 6 h; counted as delivered");
     alarm.nextAttemptAt = new Date(Date.now() + 20_000).toISOString();
     return;
   }
-  const reply = thread.messages.filter((m) => m.role === "assistant" && (m.id === turn.assistantMessageId || m.turnId === turn.turnId))
-    .map((m) => m.text ?? "").join("\n");
-  const evidence = `${reply}\n${thread.session?.lastError ?? ""}`;
-  const reset = limitResetsAt(evidence);
+  const reply = thread.reply;
+  // T3's own reset time on a usage_limit failure, else the "resets 7pm" in the reply.
+  const reset = thread.limitResetAt ? new Date(new Date(thread.limitResetAt).getTime() + 90_000) : limitResetsAt(`${reply}\n${thread.error}`);
   if (reset && alarm.kind === "continue" && reset - Date.now() > CONTINUE_WINDOW_MS + 90_000) {
     return finish(alarm, "cancelled", `a longer limit, resetting ${fmtLocal(reset.toISOString())}`);
   }
-  const delivered = !reset && (turn.state === "completed" || reply.trim());
-  if (delivered) return finish(alarm, "delivered", `reply received (${turn.state})`);
+  const delivered = !reset && (thread.state === "completed" || reply.trim());
+  if (delivered) return finish(alarm, "delivered", `reply received (${thread.state})`);
   // A continue that retries goes on from this turn. One that's delivered keeps its old turn, so the
   // scan still catches this turn if it ends at a later limit.
-  if (alarm.kind === "continue") alarm.stalledTurnId = turn.turnId;
+  if (alarm.kind === "continue") alarm.stalledTurnId = thread.runId;
   if (reset > Date.now()) {
     alarm.status = "retrying";
     alarm.nextAttemptAt = reset.toISOString();
@@ -248,7 +228,7 @@ async function verify(alarm) {
   }
   // A stated reset already past would retry at once, every tick: back off instead.
   if (reset) return backoff(alarm, "usage limit still in force after its stated reset");
-  return backoff(alarm, `turn ended ${turn.state}: ${thread.session?.lastError ?? "no reply"}`);
+  return backoff(alarm, `turn ended ${thread.state}: ${thread.error || "no reply"}`);
 }
 
 async function finish(alarm, status, note) {

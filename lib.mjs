@@ -19,7 +19,9 @@ export const DEFAULT_PORT = 47731;
 // T3 Code's own state lives here; its server writes the port it is listening on to server-runtime.json.
 export const T3_HOME = process.env.T3CODE_HOME || path.join(os.homedir(), ".t3");
 export const T3_RUNTIME = path.join(T3_HOME, "userdata", "server-runtime.json");
-export const T3_DB = path.join(T3_HOME, "userdata", "state.sqlite");
+// T3 Code 0.1.2 moved threads from state.sqlite (frozen, no longer written) to statev2.sqlite.
+export const T3_DB = path.join(T3_HOME, "userdata", "statev2.sqlite");
+export const T3_CLI = process.env.T3CODE_CLI_PATH || path.join(T3_HOME, "bin", process.platform === "win32" ? "t3.cmd" : "t3");
 
 export function readJson(file, fallback) {
   try {
@@ -104,42 +106,107 @@ export function limitResetsAt(text, from = new Date()) {
   return new Date(when.getTime() + 90_000);
 }
 
-/**
- * Threads whose latest turn ended at a usage limit no more than `windowMs` before `now`, and whose
- * limit resets no more than `windowMs` after it was hit: the five-hour limit, not the weekly one.
- * The reset time is T3's own `runtime.warning` for that turn when it recorded one (it doesn't always),
- * otherwise the "resets 7pm" in the reply, read from when the turn ended.
- */
-export async function findLimitStalls(now = new Date(), windowMs = 5 * 3600_000) {
+/** Run `fn` with a read-only handle on T3's database, closed afterwards. */
+async function withDb(fn) {
   const { DatabaseSync } = await import("node:sqlite");
   const db = new DatabaseSync(T3_DB, { readOnly: true });
-  let rows;
   try {
-    rows = db.prepare(`
-      select t.thread_id, tu.turn_id, tu.completed_at, m.text,
-        (select json_extract(a.payload_json, '$.detail.resetsAt') from projection_thread_activities a
-          where a.thread_id = t.thread_id and a.turn_id = tu.turn_id and a.kind = 'runtime.warning'
-            and json_extract(a.payload_json, '$.detail.status') = 'rejected'
-            and json_extract(a.payload_json, '$.detail.resetsAt') is not null
-          order by a.sequence desc limit 1) as resets_at
-      from projection_threads t
-      join projection_turns tu on tu.thread_id = t.thread_id and tu.turn_id = t.latest_turn_id
-      left join projection_thread_messages m on m.message_id = tu.assistant_message_id
-      where t.deleted_at is null and t.archived_at is null and tu.state = 'error'
-        and tu.completed_at >= ? and tu.completed_at <= ?`)
-      .all(new Date(now.getTime() - windowMs).toISOString(), now.toISOString());
+    return fn(db);
   } finally {
     db.close();
   }
+}
+
+/**
+ * Where a thread stands, from its latest run: `{ deletedAt, archivedAt, runId, state, requestedAt, reply, error, limitResetAt }`,
+ * or null if T3 has no such thread. `state` is the run's status (queued, running, completed, failed, ...);
+ * `reply` is the assistant text of that run and `error` the message of its terminal failure, if any.
+ */
+export async function readThreadState(threadId) {
+  return withDb((db) => {
+    const thread = db.prepare("select archived_at, deleted_at from orchestration_v2_projection_threads where thread_id = ?").get(threadId);
+    if (!thread) return null;
+    const run = db.prepare(
+      "select run_id, status, requested_at from orchestration_v2_projection_runs where thread_id = ? order by ordinal desc limit 1",
+    ).get(threadId);
+    const state = { deletedAt: thread.deleted_at, archivedAt: thread.archived_at, runId: null, state: null, requestedAt: null, reply: "", error: "" };
+    if (!run) return state;
+    const items = db.prepare(
+      `select type, json_extract(payload_json, '$.text') as text, json_extract(payload_json, '$.failure.message') as failure,
+         case json_extract(payload_json, '$.failure.class') when 'usage_limit' then json_extract(payload_json, '$.failure.resetAt') end as reset_at
+       from orchestration_v2_projection_turn_items where run_id = ? and type in ('assistant_message', 'error') order by ordinal`,
+    ).all(run.run_id);
+    return {
+      ...state, runId: run.run_id, state: run.status, requestedAt: run.requested_at,
+      reply: items.filter((i) => i.type === "assistant_message").map((i) => i.text ?? "").join("\n"),
+      error: items.filter((i) => i.type === "error").map((i) => i.failure ?? "").join("\n"),
+      limitResetAt: items.findLast((i) => i.reset_at)?.reset_at ?? null,
+    };
+  });
+}
+
+/** Which T3 thread a Claude Code session belongs to: T3 records the native session it resumes per provider thread. */
+export async function threadForClaudeSession(sessionId) {
+  return withDb((db) => db.prepare(
+    "select thread_id from orchestration_v2_projection_provider_threads where json_extract(payload_json, '$.nativeThreadRef.nativeId') = ? limit 1",
+  ).get(sessionId)?.thread_id ?? null);
+}
+
+/**
+ * Threads whose latest run failed at a usage limit no more than `windowMs` before `now`, and whose
+ * limit resets no more than `windowMs` after it was hit: the five-hour limit, not the weekly one.
+ * The reset time is the `resetAt` T3 records on the run's usage_limit failure when it has one,
+ * otherwise the "resets 7pm" in the reply, read from when the run ended. `turnId` is the run id.
+ */
+export async function findLimitStalls(now = new Date(), windowMs = 5 * 3600_000) {
+  const rows = await withDb((db) => db.prepare(`
+    select r.thread_id, r.run_id, r.completed_at,
+      (select json_extract(i.payload_json, '$.failure.resetAt') from orchestration_v2_projection_turn_items i
+        where i.run_id = r.run_id and i.type = 'error' and json_extract(i.payload_json, '$.failure.class') = 'usage_limit'
+        order by i.ordinal desc limit 1) as reset_at,
+      (select group_concat(json_extract(i.payload_json, '$.text'), char(10)) from orchestration_v2_projection_turn_items i
+        where i.run_id = r.run_id and i.type = 'assistant_message') as text,
+      exists (select 1 from orchestration_v2_projection_turn_items i
+        where i.run_id = r.run_id and i.type = 'error' and json_extract(i.payload_json, '$.failure.class') = 'usage_limit') as is_limit
+    from orchestration_v2_projection_threads t
+    join orchestration_v2_projection_runs r on r.thread_id = t.thread_id
+      and r.ordinal = (select max(ordinal) from orchestration_v2_projection_runs where thread_id = t.thread_id)
+    where t.deleted_at is null and t.archived_at is null and r.status = 'failed'
+      and r.completed_at >= ? and r.completed_at <= ?`)
+    .all(new Date(now.getTime() - windowMs).toISOString(), now.toISOString()));
   const stalls = [];
   for (const row of rows) {
     const hitAt = new Date(row.completed_at);
-    const resetAt = row.resets_at ? new Date(row.resets_at * 1000 + 90_000) : limitResetsAt(row.text ?? "", hitAt);
+    // A failed run counts only if T3 classed it as a usage limit, or its reply says it hit one.
+    const resetAt = row.reset_at ? new Date(new Date(row.reset_at).getTime() + 90_000)
+      : row.is_limit || LIMIT_RE.test(row.text ?? "") ? limitResetsAt(row.text ?? "", hitAt) : null;
     const gap = resetAt ? resetAt - 90_000 - hitAt : NaN;
     if (!(gap >= -15 * 60_000 && gap <= windowMs)) continue; // NaN fails too
-    stalls.push({ threadId: row.thread_id, turnId: row.turn_id, hitAt, resetAt });
+    stalls.push({ threadId: row.thread_id, turnId: row.run_id, hitAt, resetAt });
   }
   return stalls;
+}
+
+/**
+ * Send `text` into a thread as a user message with T3's own CLI (`t3 thread send`), which queues it
+ * behind a run in progress rather than interrupting it. Throws with the CLI's output if it refuses.
+ */
+export function sendToThread(threadId, text) {
+  return new Promise((resolve, reject) => {
+    // .cmd shims need a shell on Windows; the text goes in on stdin so it is never quoted.
+    const child = spawn(`"${T3_CLI}"`, ["thread", "send", threadId, "-"], { shell: true, windowsHide: true, env: { ...process.env, T3CODE_HOME: T3_HOME } });
+    let out = "";
+    const timer = setTimeout(() => child.kill(), 30_000);
+    child.stdout.on("data", (chunk) => (out += chunk));
+    child.stderr.on("data", (chunk) => (out += chunk));
+    child.on("error", (error) => { clearTimeout(timer); reject(error); });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve(out.trim());
+      else reject(Object.assign(new Error(`t3 thread send exited ${code}: ${out.trim().slice(0, 300)}`), { output: out }));
+    });
+    child.stdin.end(text);
+  });
 }
 
 /** Call the daemon's control API on 127.0.0.1. Throws if it isn't running. */
