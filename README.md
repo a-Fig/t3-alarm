@@ -6,7 +6,7 @@ I wanted an alarm that waits out a usage limit, survives a closed laptop, and dr
 
 ## What it does
 
-Claude Code, running in T3 Code, can set an alarm. At that time the alarm's prompt arrives in the same thread as a new message (`⏰ …`), through T3 Code's local API. It waits for a turn in progress, and if the reply is a usage-limit error it tries again after the limit resets.
+Claude Code, running in T3 Code, can set an alarm. At that time the alarm's prompt arrives in the same thread as a new message (`⏰ …`), through T3 Code's own CLI (`t3 thread send`). It waits for a turn in progress, and if the reply is a usage-limit error it tries again after the limit resets.
 
 The usual case needs no alarm at all. Any thread a usage limit stops gets `⏰ Usage limit reset — continue` once the limit resets, if it was hit in the last five hours and resets within five hours of being hit: the five-hour limit, not the weekly one.
 
@@ -55,7 +55,7 @@ node cli.mjs status | list [--all] | cancel <id> | set <thread-id> <minutes|time
 
 - The daemon (`alarmd.mjs`) listens on `127.0.0.1:47731` and keeps alarms in `~\.t3-alarm\alarms.json`. It checks every 15 seconds, so an alarm missed during sleep goes off as soon as the laptop wakes. It starts at login, with each Claude session in T3, and from each alarm's wake task.
 - Each alarm also registers a Windows scheduled task (`\t3-alarm\alarm-<id>`) a minute early, set to wake the computer, which starts the daemon if it isn't running.
-- The prompt is posted to T3 Code's HTTP API as a user message. If the thread is mid-turn it waits, up to 30 minutes.
+- The prompt is sent with `t3 thread send` as a user message, and the thread's state is read from T3's `statev2.sqlite`. If the thread is mid-turn it waits, up to 30 minutes.
 - After sending, it reads the reply. A usage-limit error means another attempt 90 seconds after the stated reset time; other failures retry with backoff.
 - Every minute it also looks in T3's database for threads whose latest turn ended at a usage limit, and gives each a continue alarm for the reset: T3's recorded reset time, or the "resets 7pm" in the reply. A continue alarm that is cancelled stays cancelled, and one is dropped if the thread has moved on by the time it goes off.
 - The MCP server finds its own thread from the `--resume=<session>` that T3 passes to Claude Code, then looks the session up in T3's database.
@@ -64,7 +64,7 @@ node cli.mjs status | list [--all] | cancel <id> | set <thread-id> <minutes|time
 
 - Windows only.
 - A sleeping laptop wakes for an alarm only if its power plan allows wake timers. Nothing fires while T3 Code is closed; the alarm goes off once it is back.
-- T3 Code's API is internal and unversioned, so an update could break this.
+- T3 Code's database layout is internal and unversioned, and an update already broke this once (0.1.2 moved threads from `state.sqlite` to `statev2.sqlite`, and removed the HTTP thread API); `node cli.mjs status` won't notice. If auto-continue stops firing, look here first.
 
 ## Uninstall
 
